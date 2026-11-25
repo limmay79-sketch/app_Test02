@@ -1,0 +1,126 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-debug:
+    name: Build APK (debug)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set +e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          mkdir -p "$SDK_ROOT/licenses"
+          printf "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$SDK_ROOT/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$SDK_ROOT/licenses/android-sdk-preview-license"
+          SDKMANAGER="$(command -v sdkmanager 2>/dev/null || true)"
+          if [ -z "$SDKMANAGER" ] && [ -d "$SDK_ROOT/cmdline-tools" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          fi
+
+      - name: Locate Android project directory
+        id: locate
+        shell: bash
+        run: |
+          PROJECT_DIR=""
+          if [ -f "settings.gradle.kts" ] || [ -f "settings.gradle" ]; then
+            PROJECT_DIR="."
+          else
+            FOUND="$(find . -maxdepth 3 \( -name "settings.gradle.kts" -o -name "settings.gradle" \) -print -quit)"
+            if [ -n "$FOUND" ]; then
+              PROJECT_DIR="$(dirname "$FOUND")"
+            fi
+          fi
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "### Build Error: Android project files not found" >> "$GITHUB_STEP_SUMMARY"
+            echo "Could not find \`settings.gradle.kts\` or \`app/\` in the repository." >> "$GITHUB_STEP_SUMMARY"
+            echo "Repository files:" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            ls -la >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "ERROR: settings.gradle.kts not found. Please push the full Android project, not just main.yml."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected Android project root: $PROJECT_DIR"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.3.1"
+          build-root-directory: ${{ steps.locate.outputs.project_dir }}
+
+      - name: Ensure Gradle 9.3.1 is on PATH
+        shell: bash
+        run: |
+          if ! command -v gradle >/dev/null 2>&1 || ! gradle --version 2>/dev/null | grep -q "Gradle 9.3.1"; then
+            curl -fsSL https://services.gradle.org/distributions/gradle-9.3.1-bin.zip -o /tmp/gradle-9.3.1.zip
+            unzip -q -o /tmp/gradle-9.3.1.zip -d /tmp/gradle-9.3.1
+            echo "/tmp/gradle-9.3.1/gradle-9.3.1/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Prepare debug.keystore
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          if [ -s debug.keystore.base64 ]; then
+            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore || rm -f debug.keystore
+          fi
+          if [ ! -s debug.keystore ]; then
+            keytool -genkeypair -v \
+              -keystore debug.keystore \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build Debug APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --version
+          if ! gradle :app:assembleDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8" 2>&1 | tee /tmp/gradle_build.log; then
+            echo "### Gradle Build Failed" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 80 /tmp/gradle_build.log >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-debug-apk
+          path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
